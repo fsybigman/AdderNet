@@ -17,8 +17,8 @@ import math
 parser = argparse.ArgumentParser(description='train-addernet')
 
 # Basic model parameters.
-parser.add_argument('--data', type=str, default='/cache/data/')
-parser.add_argument('--output_dir', type=str, default='/cache/models/')
+parser.add_argument('--data', type=str, default='./data/')
+parser.add_argument('--output_dir', type=str, default='./models/')
 args = parser.parse_args()
 
 os.makedirs(args.output_dir, exist_ok=True)  
@@ -39,13 +39,13 @@ transform_test = transforms.Compose([
 ])
 
 data_train = CIFAR10(args.data,
-                   transform=transform_train)
+                   transform=transform_train,download = True)
 data_test = CIFAR10(args.data,
                   train=False,
                   transform=transform_test)
 
-data_train_loader = DataLoader(data_train, batch_size=256, shuffle=True, num_workers=8)
-data_test_loader = DataLoader(data_test, batch_size=100, num_workers=0)
+data_train_loader = DataLoader(data_train, batch_size=128, shuffle=True, num_workers=8)
+data_test_loader = DataLoader(data_test, batch_size=64, num_workers=0)
 
 net = resnet20().cuda()
 criterion = torch.nn.CrossEntropyLoss().cuda()
