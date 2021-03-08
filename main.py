@@ -5,20 +5,55 @@
 #This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD 3-Clause License for more details.
 
 import os
-from resnet20 import resnet20
 import torch
+import adder
 from torch.autograd import Variable
 from torchvision.datasets import CIFAR10
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader 
 import argparse
 import math
+import torch.nn as nn
+
+def conv3x3(input_channel, output_channel, stride=1,op=1):
+    " 3x3 convolution with padding op:1-add 0:mul"
+    if op:
+        return adder.adder2d(input_channel, output_channel, kernel_size=3, stride=stride, padding=1, bias=False)
+    else:
+        return nn.Conv2d(input_channel, output_channel, kernel_size=3,stride=stride, padding=1, bias=False)
+
+class Net(nn.Module):
+    def __init__(self,op=1,num_classes=10):
+        super(Net,self).__init__()
+        self.conv1 = conv3x3(3,16,1,op)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.conv2 = conv3x3(16,32,1,op)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.conv3 = conv3x3(32,64,1,op)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.pool3 = nn.MaxPool2d(2, 2)
+        self.conv4 = nn.Conv2d(64,num_classes,4,1,0)
+        self.activate = nn.ReLU(inplace=True)
+
+    def forward(self,x):
+        x = self.activate(self.bn1(self.conv1(x)))
+        x = self.pool1(x)
+        x = self.activate(self.bn2(self.conv2(x)))
+        x = self.pool2(x)
+        x = self.activate(self.bn3(self.conv3(x)))
+        x = self.pool3(x)
+        x = self.conv4(x)
+        return x.squeeze(-1).squeeze(-1)
+
 
 parser = argparse.ArgumentParser(description='train-addernet')
 
 # Basic model parameters.
 parser.add_argument('--data', type=str, default='./data/')
 parser.add_argument('--output_dir', type=str, default='./models/')
+parser.add_argument('--load_path_n', type=int, default=-1)
 args = parser.parse_args()
 
 os.makedirs(args.output_dir, exist_ok=True)  
@@ -44,12 +79,25 @@ data_test = CIFAR10(args.data,
                   train=False,
                   transform=transform_test)
 
-data_train_loader = DataLoader(data_train, batch_size=128, shuffle=True, num_workers=8)
-data_test_loader = DataLoader(data_test, batch_size=64, num_workers=0)
+data_train_loader = DataLoader(data_train, batch_size=16, shuffle=True, num_workers=1)
+data_test_loader = DataLoader(data_test, batch_size=16, num_workers=1)
 
-net = resnet20().cuda()
-criterion = torch.nn.CrossEntropyLoss().cuda()
-optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
+
+Addnet = Net(1,10).to(device)
+Mulnet = Net(0,10).to(device)
+if args.load_path_n != -1:
+    Addnet = torch.load('./models/'+str(args.load_path_n)+'_addernet.pth', map_location=device)
+    Mulnet = torch.load('./models/'+str(args.load_path_n)+'_mulnet.pth', map_location=device)
+
+criterionadd = torch.nn.CrossEntropyLoss().to(device)
+criterionmul = torch.nn.CrossEntropyLoss().to(device)
+
+# optimizeradd = torch.optim.SGD(Addnet.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4)
+# optimizermul = torch.optim.SGD(Mulnet.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4)
+optimizeradd = torch.optim.Adam(Addnet.parameters(), lr=0.0005)
+optimizermul = torch.optim.Adam(Mulnet.parameters(), lr=0.0005)
 
 def adjust_learning_rate(optimizer, epoch):
     """For resnet, the lr starts from 0.1, and is divided by 10 at 80 and 120 epochs"""
@@ -58,60 +106,61 @@ def adjust_learning_rate(optimizer, epoch):
         param_group['lr'] = lr
         
 def train(epoch):
-    adjust_learning_rate(optimizer, epoch)
-    global cur_batch_win
-    net.train()
-    loss_list, batch_list = [], []
+    # adjust_learning_rate(optimizeradd, epoch)
+    # adjust_learning_rate(optimizermul, epoch)
+
     for i, (images, labels) in enumerate(data_train_loader):
-        images, labels = Variable(images).cuda(), Variable(labels).cuda()
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizeradd.zero_grad()
+        optimizermul.zero_grad()
  
-        optimizer.zero_grad()
+        outputadd = Addnet(images)
+        outputmul = Mulnet(images)
  
-        output = net(images)
+        lossadd = criterionadd(outputadd, labels)
+        lossmul = criterionmul(outputmul, labels)
  
-        loss = criterion(output, labels)
+        if i%50 == 0:
+            print('ADD Train - Epoch %d, Batch: %d, Loss: %f' % (epoch, i, lossadd.data.item()))
+            print('MUL Train - Epoch %d, Batch: %d, Loss: %f' % (epoch, i, lossmul.data.item()))
  
-        loss_list.append(loss.data.item())
-        batch_list.append(i+1)
- 
-        if i == 1:
-            print('Train - Epoch %d, Batch: %d, Loss: %f' % (epoch, i, loss.data.item()))
- 
-        loss.backward()
-        optimizer.step()
+        lossadd.backward()
+        optimizeradd.step()
+        lossmul.backward()
+        optimizermul.step()
  
  
-def test():
-    global acc, acc_best
-    net.eval()
-    total_correct = 0
-    avg_loss = 0.0
-    with torch.no_grad():
-        for i, (images, labels) in enumerate(data_test_loader):
-            images, labels = Variable(images).cuda(), Variable(labels).cuda()
-            output = net(images)
-            avg_loss += criterion(output, labels).sum()
-            pred = output.data.max(1)[1]
-            total_correct += pred.eq(labels.data.view_as(pred)).sum()
- 
-    avg_loss /= len(data_test)
-    acc = float(total_correct) / len(data_test)
-    if acc_best < acc:
-        acc_best = acc
-    print('Test Avg. Loss: %f, Accuracy: %f' % (avg_loss.data.item(), acc))
+# def test():
+#     global acc, acc_best
+#     net.eval()
+#     total_correct = 0
+#     avg_loss = 0.0
+#     with torch.no_grad():
+#         for i, (images, labels) in enumerate(data_test_loader):
+#             images, labels = Variable(images).to(device), Variable(labels).to(device)
+#             output = net(images)
+#             avg_loss += criterion(output, labels).sum()
+#             pred = output.data.max(1)[1]
+#             total_correct += pred.eq(labels.data.view_as(pred)).sum()
+#
+#     avg_loss /= len(data_test)
+#     acc = float(total_correct) / len(data_test)
+#     if acc_best < acc:
+#         acc_best = acc
+#     print('Test Avg. Loss: %f, Accuracy: %f' % (avg_loss.data.item(), acc))
  
  
 def train_and_test(epoch):
     train(epoch)
-    test()
+    # test()
+
  
- 
-def main():
+if __name__ == '__main__':
     epoch = 400
     for e in range(1, epoch):
         train_and_test(e)
-    torch.save(net,args.output_dir + 'addernet')
- 
- 
-if __name__ == '__main__':
-    main()
+        if epoch%5 == 0:
+            torch.save(Addnet.state_dict(),args.output_dir + str(e) + '_addernet.pth')
+            torch.save(Mulnet.state_dict(), args.output_dir + str(e) + '_mulnet.pth')
